@@ -29,7 +29,6 @@ static esp_adc_cal_characteristics_t *adc_chars;
 static adc_continuous_handle_t adc_handle = NULL;
 static TaskHandle_t adc_task_handle = NULL;
 
-
 static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle,
                                      const adc_continuous_evt_data_t *edata,
                                      void *user_data)
@@ -78,20 +77,22 @@ static void continuous_adc_init(void)
     ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(adc_handle, &cbs, NULL));
     ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
 }
+
 #define MAX_RMS_SAMPLES 200
-// Move big buffers to static so they are not on task stack
+// Store AC RMS values per window
 static double rms_buffer_ch1[MAX_RMS_SAMPLES];
 static double rms_buffer_ch2[MAX_RMS_SAMPLES];
 
 static void adc_task(void *arg)
 {
-    // smaller stack-local footprint now
     uint8_t result[EXAMPLE_READ_LEN] = {0};
 
     uint32_t rms_count_ch1 = 0;
     uint32_t rms_count_ch2 = 0;
 
-    double sum_sq_ch1 = 0, sum_sq_ch2 = 0;
+    // Buffers for raw voltages per window
+    static double sample_buf_ch1[EXAMPLE_READ_LEN];
+    static double sample_buf_ch2[EXAMPLE_READ_LEN];
     uint32_t sample_count_ch1 = 0, sample_count_ch2 = 0;
 
     TickType_t last_tick = xTaskGetTickCount();
@@ -108,22 +109,20 @@ static void adc_task(void *arg)
                     uint32_t chan = EXAMPLE_ADC_GET_CHANNEL(p);
                     uint32_t raw = EXAMPLE_ADC_GET_DATA(p);
 
-                    // Mask raw to expected ADC resolution (12-bit typical)
-                    // If you use a different width, change mask accordingly.
-                    raw &= 0x0FFF;
-
+                    raw &= 0x0FFF; // 12-bit mask
                     uint32_t voltage = esp_adc_cal_raw_to_voltage(raw, adc_chars);
 
                     if (chan == (EXAMPLE_ADC_CHANNEL_1 & 0x7)) {
-                        sum_sq_ch1 += (double)voltage * (double)voltage;
-                        sample_count_ch1++;
+                        if (sample_count_ch1 < EXAMPLE_READ_LEN) {
+                            sample_buf_ch1[sample_count_ch1++] = (double)voltage;
+                        }
                     } else if (chan == (EXAMPLE_ADC_CHANNEL_2 & 0x7)) {
-                        sum_sq_ch2 += (double)voltage * (double)voltage;
-                        sample_count_ch2++;
+                        if (sample_count_ch2 < EXAMPLE_READ_LEN) {
+                            sample_buf_ch2[sample_count_ch2++] = (double)voltage;
+                        }
                     }
                 }
             } else if (ret == ESP_ERR_TIMEOUT || ret == ESP_OK) {
-                // nothing more to read right now
                 break;
             } else {
                 ESP_LOGW(TAG, "adc_continuous_read err: 0x%x", ret);
@@ -131,16 +130,37 @@ static void adc_task(void *arg)
             }
         }
 
-        // Compute instantaneous RMS for each channel
+        // --- Compute AC RMS per notification window ---
         if (sample_count_ch1 > 0) {
-            double rms = sqrt(sum_sq_ch1 / sample_count_ch1);
-            if (rms_count_ch1 < MAX_RMS_SAMPLES) rms_buffer_ch1[rms_count_ch1++] = rms;
-            sum_sq_ch1 = 0; sample_count_ch1 = 0;
+            double sum = 0;
+            for (uint32_t i = 0; i < sample_count_ch1; i++) sum += sample_buf_ch1[i];
+            double mean = sum / sample_count_ch1;
+
+            double ac_sum_sq = 0;
+            for (uint32_t i = 0; i < sample_count_ch1; i++) {
+                double ac = sample_buf_ch1[i] - mean;
+                ac_sum_sq += ac * ac;
+            }
+            double ac_rms = sqrt(ac_sum_sq / sample_count_ch1);
+
+            if (rms_count_ch1 < MAX_RMS_SAMPLES) rms_buffer_ch1[rms_count_ch1++] = ac_rms;
+            sample_count_ch1 = 0;
         }
+
         if (sample_count_ch2 > 0) {
-            double rms = sqrt(sum_sq_ch2 / sample_count_ch2);
-            if (rms_count_ch2 < MAX_RMS_SAMPLES) rms_buffer_ch2[rms_count_ch2++] = rms;
-            sum_sq_ch2 = 0; sample_count_ch2 = 0;
+            double sum = 0;
+            for (uint32_t i = 0; i < sample_count_ch2; i++) sum += sample_buf_ch2[i];
+            double mean = sum / sample_count_ch2;
+
+            double ac_sum_sq = 0;
+            for (uint32_t i = 0; i < sample_count_ch2; i++) {
+                double ac = sample_buf_ch2[i] - mean;
+                ac_sum_sq += ac * ac;
+            }
+            double ac_rms = sqrt(ac_sum_sq / sample_count_ch2);
+
+            if (rms_count_ch2 < MAX_RMS_SAMPLES) rms_buffer_ch2[rms_count_ch2++] = ac_rms;
+            sample_count_ch2 = 0;
         }
 
         // Every 1s, compute stats per channel
@@ -151,8 +171,7 @@ static void adc_task(void *arg)
 
                 if (rms_count_ch1 > 0) {
                     double sum = 0, var = 0;
-                    stats_ch1.min = rms_buffer_ch1[0];
-                    stats_ch1.max = rms_buffer_ch1[0];
+                    stats_ch1.min = stats_ch1.max = rms_buffer_ch1[0];
                     for (uint32_t i = 0; i < rms_count_ch1; i++) {
                         double v = rms_buffer_ch1[i];
                         if (v < stats_ch1.min) stats_ch1.min = v;
@@ -169,8 +188,7 @@ static void adc_task(void *arg)
 
                 if (rms_count_ch2 > 0) {
                     double sum = 0, var = 0;
-                    stats_ch2.min = rms_buffer_ch2[0];
-                    stats_ch2.max = rms_buffer_ch2[0];
+                    stats_ch2.min = stats_ch2.max = rms_buffer_ch2[0];
                     for (uint32_t i = 0; i < rms_count_ch2; i++) {
                         double v = rms_buffer_ch2[i];
                         if (v < stats_ch2.min) stats_ch2.min = v;
@@ -196,7 +214,6 @@ static void adc_task(void *arg)
                     .C_sd  = (rms_count_ch2>0)?stats_ch2.sd:0
                 };
 
-                // check callback before calling
                 if (_telemetry_data_cb) {
                     _telemetry_data_cb(data);
                 } else {
