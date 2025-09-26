@@ -8,179 +8,216 @@
 #include "esp_adc/adc_continuous.h"
 #include "esp_adc_cal.h"
 #include "volt_monitor.h"
+
 #define EXAMPLE_ADC_UNIT            ADC_UNIT_1
-#define EXAMPLE_ADC_CHANNEL         ADC_CHANNEL_6
+#define EXAMPLE_ADC_CHANNEL_1       ADC_CHANNEL_6  // GPIO34
+#define EXAMPLE_ADC_CHANNEL_2       ADC_CHANNEL_5  // GPIO36
 #define EXAMPLE_ADC_ATTEN           ADC_ATTEN_DB_11
 #define EXAMPLE_ADC_BIT_WIDTH       SOC_ADC_DIGI_MAX_BITWIDTH
 #define EXAMPLE_ADC_CONV_MODE       ADC_CONV_SINGLE_UNIT_1
 #define EXAMPLE_ADC_OUTPUT_TYPE     ADC_DIGI_OUTPUT_FORMAT_TYPE2
 #define EXAMPLE_READ_LEN            256
 
-#define EXAMPLE_ADC_GET_CHANNEL(p_data)     ((p_data)->type2.channel)
-#define EXAMPLE_ADC_GET_DATA(p_data)        ((p_data)->type2.data)
+#define EXAMPLE_ADC_GET_CHANNEL(p_data) ((p_data)->type2.channel)
+#define EXAMPLE_ADC_GET_DATA(p_data)    ((p_data)->type2.data)
 
-static const char *TAG = "ADC_SINGLE";
+static const char *TAG = "ADC_DUAL";
 
-static data_cb_t _volt_data_cb;
-// ADC calibration handle
+static data_cb_t _telemetry_data_cb;
+
 static esp_adc_cal_characteristics_t *adc_chars;
-
-// ADC continuous driver handle
 static adc_continuous_handle_t adc_handle = NULL;
-
-// Task handle for ADC task
 static TaskHandle_t adc_task_handle = NULL;
 
-// Conversion done callback
-static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
+
+static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle,
+                                     const adc_continuous_evt_data_t *edata,
+                                     void *user_data)
 {
     BaseType_t mustYield = pdFALSE;
     vTaskNotifyGiveFromISR(adc_task_handle, &mustYield);
     return (mustYield == pdTRUE);
 }
 
-// ADC continuous init function
 static void continuous_adc_init(void)
 {
     adc_continuous_handle_cfg_t adc_config = {
-        .max_store_buf_size = 1024,
+        .max_store_buf_size = 2048,
         .conv_frame_size = EXAMPLE_READ_LEN,
     };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
 
     adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = 1000,  // 1 kHz sampling
+        .sample_freq_hz = 1000,
         .conv_mode = EXAMPLE_ADC_CONV_MODE,
         .format = EXAMPLE_ADC_OUTPUT_TYPE,
-        .pattern_num = 1,
+        .pattern_num = 2,  // two channels
     };
 
     adc_digi_pattern_config_t adc_pattern[SOC_ADC_PATT_LEN_MAX] = {0};
+
+    // Channel 1
     adc_pattern[0].atten = EXAMPLE_ADC_ATTEN;
-    adc_pattern[0].channel = EXAMPLE_ADC_CHANNEL & 0x7;
+    adc_pattern[0].channel = EXAMPLE_ADC_CHANNEL_1 & 0x7;
     adc_pattern[0].unit = EXAMPLE_ADC_UNIT;
     adc_pattern[0].bit_width = EXAMPLE_ADC_BIT_WIDTH;
 
+    // Channel 2
+    adc_pattern[1].atten = EXAMPLE_ADC_ATTEN;
+    adc_pattern[1].channel = EXAMPLE_ADC_CHANNEL_2 & 0x7;
+    adc_pattern[1].unit = EXAMPLE_ADC_UNIT;
+    adc_pattern[1].bit_width = EXAMPLE_ADC_BIT_WIDTH;
+
     dig_cfg.adc_pattern = adc_pattern;
-    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
 
     adc_continuous_evt_cbs_t cbs = {
         .on_conv_done = s_conv_done_cb,
     };
+
+    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
     ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(adc_handle, &cbs, NULL));
     ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
 }
+#define MAX_RMS_SAMPLES 200
+// Move big buffers to static so they are not on task stack
+static double rms_buffer_ch1[MAX_RMS_SAMPLES];
+static double rms_buffer_ch2[MAX_RMS_SAMPLES];
 
-// ADC task: reads values and calculates RMS, min, max, mean every second
-// ADC task: continuous RMS + per-second stats on RMS values
 static void adc_task(void *arg)
 {
+    // smaller stack-local footprint now
     uint8_t result[EXAMPLE_READ_LEN] = {0};
-    memset(result, 0xcc, EXAMPLE_READ_LEN);
 
-    double sum_sq = 0;
-    uint32_t sample_count = 0;
+    uint32_t rms_count_ch1 = 0;
+    uint32_t rms_count_ch2 = 0;
 
-    // Buffer for storing continuous RMS values within 1s
-    #define MAX_RMS_SAMPLES 200   // ~200 batches per sec at 1kHz, adjust as needed
-    double rms_buffer[MAX_RMS_SAMPLES];
-    uint32_t rms_count = 0;
+    double sum_sq_ch1 = 0, sum_sq_ch2 = 0;
+    uint32_t sample_count_ch1 = 0, sample_count_ch2 = 0;
 
     TickType_t last_tick = xTaskGetTickCount();
 
     while (1) {
-        // Wait for ADC conversion done notification
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         uint32_t ret_num = 0;
         while (1) {
             esp_err_t ret = adc_continuous_read(adc_handle, result, EXAMPLE_READ_LEN, &ret_num, 0);
-            if (ret == ESP_OK) {
-                for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
+            if (ret == ESP_OK && ret_num > 0) {
+                for (uint32_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
                     adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result[i];
-                    uint32_t chan_num = EXAMPLE_ADC_GET_CHANNEL(p);
+                    uint32_t chan = EXAMPLE_ADC_GET_CHANNEL(p);
                     uint32_t raw = EXAMPLE_ADC_GET_DATA(p);
 
-                    if (chan_num < SOC_ADC_CHANNEL_NUM(EXAMPLE_ADC_UNIT)) {
-                        uint32_t voltage = esp_adc_cal_raw_to_voltage(raw, adc_chars);
-                        sum_sq += ((double)voltage * voltage);
-                        sample_count++;
+                    // Mask raw to expected ADC resolution (12-bit typical)
+                    // If you use a different width, change mask accordingly.
+                    raw &= 0x0FFF;
+
+                    uint32_t voltage = esp_adc_cal_raw_to_voltage(raw, adc_chars);
+
+                    if (chan == (EXAMPLE_ADC_CHANNEL_1 & 0x7)) {
+                        sum_sq_ch1 += (double)voltage * (double)voltage;
+                        sample_count_ch1++;
+                    } else if (chan == (EXAMPLE_ADC_CHANNEL_2 & 0x7)) {
+                        sum_sq_ch2 += (double)voltage * (double)voltage;
+                        sample_count_ch2++;
                     }
                 }
-            } else if (ret == ESP_ERR_TIMEOUT) {
+            } else if (ret == ESP_ERR_TIMEOUT || ret == ESP_OK) {
+                // nothing more to read right now
+                break;
+            } else {
+                ESP_LOGW(TAG, "adc_continuous_read err: 0x%x", ret);
                 break;
             }
         }
 
-        // Compute instantaneous RMS for this batch
-        if (sample_count > 0) {
-            double rms = sqrt(sum_sq / sample_count);
-            // ESP_LOGI(TAG, "Continuous RMS: %.2f mV", rms);
-
-            // Save in buffer
-            if (rms_count < MAX_RMS_SAMPLES) {
-                rms_buffer[rms_count++] = rms;
-            }
-
-            // Reset accumulators for next batch
-            sum_sq = 0;
-            sample_count = 0;
+        // Compute instantaneous RMS for each channel
+        if (sample_count_ch1 > 0) {
+            double rms = sqrt(sum_sq_ch1 / sample_count_ch1);
+            if (rms_count_ch1 < MAX_RMS_SAMPLES) rms_buffer_ch1[rms_count_ch1++] = rms;
+            sum_sq_ch1 = 0; sample_count_ch1 = 0;
+        }
+        if (sample_count_ch2 > 0) {
+            double rms = sqrt(sum_sq_ch2 / sample_count_ch2);
+            if (rms_count_ch2 < MAX_RMS_SAMPLES) rms_buffer_ch2[rms_count_ch2++] = rms;
+            sum_sq_ch2 = 0; sample_count_ch2 = 0;
         }
 
-        // Every 1s, compute stats
+        // Every 1s, compute stats per channel
         TickType_t now = xTaskGetTickCount();
         if ((now - last_tick) >= pdMS_TO_TICKS(1000)) {
-            if (rms_count > 0) {
-                double min_rms = rms_buffer[0];
-                double max_rms = rms_buffer[0];
-                double sum_rms = 0;
+            if (rms_count_ch1 > 0 || rms_count_ch2 > 0) {
+                adc_stats_tmp_t stats_ch1 = {0}, stats_ch2 = {0};
 
-                for (uint32_t i = 0; i < rms_count; i++) {
-                    if (rms_buffer[i] < min_rms) min_rms = rms_buffer[i];
-                    if (rms_buffer[i] > max_rms) max_rms = rms_buffer[i];
-                    sum_rms += rms_buffer[i];
+                if (rms_count_ch1 > 0) {
+                    double sum = 0, var = 0;
+                    stats_ch1.min = rms_buffer_ch1[0];
+                    stats_ch1.max = rms_buffer_ch1[0];
+                    for (uint32_t i = 0; i < rms_count_ch1; i++) {
+                        double v = rms_buffer_ch1[i];
+                        if (v < stats_ch1.min) stats_ch1.min = v;
+                        if (v > stats_ch1.max) stats_ch1.max = v;
+                        sum += v;
+                    }
+                    stats_ch1.avg = sum / rms_count_ch1;
+                    for (uint32_t i = 0; i < rms_count_ch1; i++) {
+                        double d = rms_buffer_ch1[i] - stats_ch1.avg;
+                        var += d * d;
+                    }
+                    stats_ch1.sd = sqrt(var / rms_count_ch1);
                 }
 
-                double mean_rms = sum_rms / rms_count;
-
-                // Compute standard deviation
-                double var = 0;
-                for (uint32_t i = 0; i < rms_count; i++) {
-                    double diff = rms_buffer[i] - mean_rms;
-                    var += diff * diff;
+                if (rms_count_ch2 > 0) {
+                    double sum = 0, var = 0;
+                    stats_ch2.min = rms_buffer_ch2[0];
+                    stats_ch2.max = rms_buffer_ch2[0];
+                    for (uint32_t i = 0; i < rms_count_ch2; i++) {
+                        double v = rms_buffer_ch2[i];
+                        if (v < stats_ch2.min) stats_ch2.min = v;
+                        if (v > stats_ch2.max) stats_ch2.max = v;
+                        sum += v;
+                    }
+                    stats_ch2.avg = sum / rms_count_ch2;
+                    for (uint32_t i = 0; i < rms_count_ch2; i++) {
+                        double d = rms_buffer_ch2[i] - stats_ch2.avg;
+                        var += d * d;
+                    }
+                    stats_ch2.sd = sqrt(var / rms_count_ch2);
                 }
-                double stddev = sqrt(var / rms_count);
-                adc_stats_t data= {
-                    .min = min_rms,
-                    .max = max_rms,
-                    .avg = mean_rms,
-                    .sd = stddev
+
+                adc_stats_t data = {
+                    .V_min = (rms_count_ch1>0)?stats_ch1.min:0,
+                    .V_max = (rms_count_ch1>0)?stats_ch1.max:0,
+                    .V_avg = (rms_count_ch1>0)?stats_ch1.avg:0,
+                    .V_sd  = (rms_count_ch1>0)?stats_ch1.sd:0,
+                    .C_min = (rms_count_ch2>0)?stats_ch2.min:0,
+                    .C_max = (rms_count_ch2>0)?stats_ch2.max:0,
+                    .C_avg = (rms_count_ch2>0)?stats_ch2.avg:0,
+                    .C_sd  = (rms_count_ch2>0)?stats_ch2.sd:0
                 };
-                _volt_data_cb(data);
-                // ESP_LOGI(TAG,
-                //          "Stats (1s) -> Min RMS: %.2f mV, Max RMS: %.2f mV, Mean RMS: %.2f mV, StdDev: %.2f mV",
-                //          min_rms, max_rms, mean_rms, stddev);
+
+                // check callback before calling
+                if (_telemetry_data_cb) {
+                    _telemetry_data_cb(data);
+                } else {
+                    ESP_LOGW(TAG, "telemetry callback is NULL");
+                }
             }
 
-            // Reset for next interval
-            rms_count = 0;
+            rms_count_ch1 = 0;
+            rms_count_ch2 = 0;
             last_tick = now;
         }
+
+        taskYIELD();
     }
 }
 
-
 void init_volt_monitor(data_cb_t volt_data_cb){
-    _volt_data_cb = volt_data_cb;
-
-    // ADC calibration init
+    _telemetry_data_cb = volt_data_cb;
     adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
     esp_adc_cal_characterize(EXAMPLE_ADC_UNIT, EXAMPLE_ADC_ATTEN, EXAMPLE_ADC_BIT_WIDTH, 0, adc_chars);
 
-    // Initialize ADC
     continuous_adc_init();
-
-    // Create FreeRTOS task for ADC processing
     xTaskCreate(adc_task, "adc_task", 4096, NULL, 10, &adc_task_handle);
-
 }

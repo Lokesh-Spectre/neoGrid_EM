@@ -44,17 +44,17 @@ void http_post_json(const char *url, const char *json_data) {
 // Task that handles HTTP posting
 static void http_post_task(void *arg) {
     adc_stats_t stats;
-    char json_buf[128];
+    char json_buf[256];
 
     while (1) {
         // Block until new data arrives
         if (xQueueReceive(*stats_queue, &stats, portMAX_DELAY)) {
-            ESP_LOGI(TAG, "HTTP POST: min=%lf, max=%lf, avg=%lf, sd=%lf",
-                     stats.min, stats.max, stats.avg, stats.sd);
+            ESP_LOGI(TAG, "HTTP POST: REQUEST SENDING....");
 
             snprintf(json_buf, sizeof(json_buf),
-                     "{\"nodeId\":\"\",\"level\":\"info\",\"Voltage_min\":%lf,\"Voltage_max\":%lf,\"Voltage_avg\":%lf,\"Voltage_sd\":%lf}",
-                     stats.min, stats.max, stats.avg, stats.sd);
+                     "{\"nodeId\":\"node-ZzB_1f\",\"level\":\"info\",\"Voltage_min\":%.03lf,\"Voltage_max\":%.03lf,\"Voltage_avg\":%.03lf,\"Voltage_sd\":%.03lf,\"Current_min\":%.03lf,\"Current_max\":%.03lf,\"Current_avg\":%.03lf,\"Current_sd\":%.03lf}",
+                     stats.V_min, stats.V_max, stats.V_avg, stats.V_sd,
+                     stats.C_min, stats.C_max, stats.C_avg, stats.C_sd);
 
             // HTTP POST
             http_post_json(BACKEND_ENDPOINT, json_buf);

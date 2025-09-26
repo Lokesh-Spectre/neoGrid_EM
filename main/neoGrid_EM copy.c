@@ -1,42 +1,69 @@
+#include <string.h>
+#include <stdio.h>
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "volt_monitor.h"
+#include "esp_http_client.h"
+#include "nvs_flash.h"
+#include "wifi_man.h"
+#include "telemetry.h"
+#include "driver/gpio.h"
 
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include "driver/adc.h" 
-#include "hal/adc_types.h"
-#include "esp_adc/adc_oneshot.h"
-
-void app_main(){
-// In your task or main loop:
-
-// In your task or main loop:
-adc_oneshot_unit_handle_t adc1_handle;
-
-// Initialize ADC unit
-adc_oneshot_unit_init_cfg_t init_cfg1 = {
-    .unit_id = ADC_UNIT_1,               // Use ADC1
-    .ulp_mode = ADC_ULP_MODE_DISABLE,    // Disable ULP mode
-};
-ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg1, &adc1_handle));
-
-// Configure channel
-adc_oneshot_chan_cfg_t config = {
-    .atten = ADC_ATTEN_DB_11,            // Up to ~3.3V on ADC1 (not 8.1V on ESP32!)
-    .bitwidth = ADC_BITWIDTH_DEFAULT,    // Default resolution for this chip
-};
-
-adc_channel_t channel = ADC_CHANNEL_8;   // GPIO36 on ESP32
-ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, channel, &config));
-while (1) {
-    // Get ADC raw value
-    int raw_value;
-    ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, channel, &raw_value));
-    printf("RAW: %d\n",raw_value);
-    // Optional: Get calibrated voltage
-    // float voltage;
-    // ESP_ERROR_CHECK(adc_oneshot_get_calibrated_voltage(adc1_handle, channel, &voltage));
-
-    // Process your raw_value or voltage here
-
-    vTaskDelay(pdMS_TO_TICKS(1)); // Delay for 1ms to achieve 1000Hz
+static const char *TAG = "APP";
+#define RELAY_PIN 8
+void relay_init(){
+        // Configure GPIO
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << RELAY_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
 }
+void relay_state(bool state){
+    if (state){
+        gpio_set_level(RELAY_PIN, 1);
+    }else{
+        gpio_set_level(RELAY_PIN, 0);
+    }
+}
+// Queue handle for passing ADC stats
+static QueueHandle_t stats_queue;
+
+// Callback: only pushes data to queue
+void volt_data_cb(adc_stats_t data) {
+    if (stats_queue) {
+        // Non-blocking, if queue full we can decide to overwrite or drop
+        if (xQueueSend(stats_queue, &data, 0) != pdPASS) {
+            ESP_LOGW(TAG, "Stats queue full, dropping data");
+        }
+    }
+}
+
+void app_main(void) {
+        // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    wifi_init();
+    wait_for_wifi_connect();
+    
+    // Create queue for ADC stats
+    stats_queue = xQueueCreate(10, sizeof(adc_stats_t));
+    if (stats_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create stats queue");
+        return;
+    }
+
+    telemetry_init(&stats_queue);
+    // Init voltage monitor with callback
+    init_volt_monitor(volt_data_cb);
+    ESP_LOGI(TAG, "INIT DONE");
 }
